@@ -49,4 +49,4 @@
 | previous_value         | text            | optional                                            |
 | new_value              | string          | optional                                            |
 | event_metadata         | string          | Workflow or AI metadata                             |
-| created_at             | string          | Required                                            |
+| created_at             | timestamp       | Required                                            |
