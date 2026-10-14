@@ -8,7 +8,7 @@ Desired state:
     - Summary
     - Category
     - Missing information
-    - suggested risk level
+    - Suggested risk level
 6. Requester receives a preview outcome and confirms submission.
 7. Request saved as SUBMITTED
 8. FastAPI sends event to n8n

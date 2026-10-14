@@ -1,6 +1,6 @@
 The current CRM change process relies on spreadsheets, email, Slack and manual checking. Requests often omit required information, may contain stale current values and lack consistent approval controls.
 
-This increases processing effor, creates a risk of incorrect CRM updates and makes it difficult to demonstrate who requested, approved and executed each change.
+This increases processing effort, creates a risk of incorrect CRM updates and makes it difficult to demonstrate who requested, approved and executed each change.
 
 Typical requests:
 - Reassigning account owners

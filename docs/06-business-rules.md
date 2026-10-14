@@ -34,7 +34,7 @@ BR-010: High-risk requests require compliance review
 
 BR-011: Approval and rejection require an approver comment.
 
-BR-012: Every action should create an audit event. This includes status changes, commends added, etc.
+BR-012: Every action should create an audit event. This includes status changes, comments added, etc.
 
 BR-013: Audit events cannot be updated or deleted in the application API.
 
