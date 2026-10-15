@@ -17,10 +17,8 @@ from enum import Enum as PyEnum
 from typing import Any, Optional
 
 from dotenv import load_dotenv
-from decimal import Decimal
-
 from sqlalchemy import (
-    DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, create_engine,
+    DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine,
     func, inspect, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -32,6 +30,7 @@ from schemas import (
     Decision,
     Priority,
     RiskLevel,
+    SalesforceObject,
     UserRole,
 )
 
@@ -166,15 +165,11 @@ class ChangeRequestORM(Base):
 
 
 class ChangeRequestItemORM(Base):
-    """One uploaded CSV row: one Salesforce account and the fields to change on it.
-
-    The changeable columns are NULL when the row doesn't change that field.
-    """
+    """One uploaded CSV row: a single field change on a single Salesforce record."""
     __tablename__ = "change_request_items"
     __table_args__ = (
-        # Each account appears at most once per request.
-        UniqueConstraint("change_request_id", "salesforce_account_id",
-                         name="uq_item_account_per_request"),
+        # The same record + field can appear only once per request.
+        UniqueConstraint("change_request_id", "record_id", "field", name="uq_item_change_per_request"),
     )
 
     account_id: Mapped[uuid.UUID] = uuid_pk()
@@ -183,20 +178,29 @@ class ChangeRequestItemORM(Base):
     )
     row_number: Mapped[int] = mapped_column(Integer, nullable=False)
 
-    # Identifying fields (mandatory in the CSV)
+    # Who/what the change is about (mandatory in the CSV)
     salesforce_account_id: Mapped[str] = mapped_column(String(18), nullable=False, index=True)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
     email: Mapped[str] = mapped_column(String(320), nullable=False)
     role: Mapped[str] = mapped_column(String(100), nullable=False)
 
-    # Changeable fields (NULL = no change)
-    country: Mapped[Optional[str]] = mapped_column(String(80))
-    industry: Mapped[Optional[str]] = mapped_column(String(80))
-    account_owner: Mapped[Optional[str]] = mapped_column(String(200))
-    amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
-    record_status: Mapped[Optional[str]] = mapped_column(String(100))  # the CSV's status column
+    # The change itself
+    object_type: Mapped[SalesforceObject] = mapped_column(
+        pg_enum(SalesforceObject, "salesforce_object"), nullable=False
+    )
+    record_id: Mapped[str] = mapped_column(String(18), nullable=False)
+    field: Mapped[str] = mapped_column(String(40), nullable=False)
+    current_value: Mapped[str] = mapped_column(Text, nullable=False, default="")  # "" = blank in Salesforce
+    new_value: Mapped[str] = mapped_column(Text, nullable=False)
+
+    # Problems found by the latest validation (empty list = passed)
+    issues: Mapped[list[dict[str, Any]]] = mapped_column(JSONB, nullable=False, default=list)
 
     change_request: Mapped[ChangeRequestORM] = relationship(back_populates="items")
+
+
+# Lets clash checks find other requests changing the same record + field quickly.
+Index("ix_items_record_field", ChangeRequestItemORM.record_id, ChangeRequestItemORM.field)
 
 
 class ApprovalDecisionORM(Base):
@@ -254,15 +258,16 @@ def init_db() -> None:
 
 
 def check_items_table_is_current() -> None:
-    """Stop with clear instructions if change_request_items still has the old
-    one-row-per-field-change columns (create_all() can't change an existing table)."""
+    """Stop with clear instructions if change_request_items was created for an older CSV
+    layout (create_all() can't change an existing table)."""
     if not inspect(engine).has_table("change_request_items"):
         return
-    columns = {c["name"] for c in inspect(engine).get_columns("change_request_items")}
-    if "salesforce_account_id" not in columns:
+    existing = {c["name"] for c in inspect(engine).get_columns("change_request_items")}
+    expected = set(ChangeRequestItemORM.__table__.columns.keys())
+    if existing != expected:
         raise RuntimeError(
-            "The change_request_items table has the old CSV layout. Its rows can't be used with the "
-            "new template, so remove it and restart (the table is recreated automatically):\n"
+            "The change_request_items table was created for an older CSV layout. Its rows can't be "
+            "used with the current template, so remove it and restart (it is recreated automatically):\n"
             "    docker exec -it change-requests-db psql -U cr_user -d change_requests "
             "-c 'DROP TABLE change_request_items;'"
         )
@@ -295,4 +300,3 @@ if __name__ == "__main__":
         raise SystemExit(f"Cannot reach the database at {engine.url!r}. Is `docker compose up -d` running?")
     init_db()
     print("Tables ready:", ", ".join(Base.metadata.tables))
-    

@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import os
 from contextlib import asynccontextmanager
+from datetime import datetime, timedelta
 from typing import Any, Optional
 from uuid import UUID
 
@@ -25,7 +26,7 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from csv_template import MAX_FILE_BYTES, parse_csv, summarise, template_csv
+from csv_template import MAX_FILE_BYTES, ParsedRow, parse_csv, summarise, template_csv
 from database import (
     ApprovalDecisionORM,
     AuditEventORM,
@@ -53,10 +54,14 @@ from schemas import (
     ImplementRequest,
     N8nRequestSubmittedPayload,
     Priority,
+    SubmitResponse,
     User,
     UserCreate,
+    ValidationIssue,
+    ValidationReport,
     utcnow,
 )
+from validation import validate_request
 
 # ---------------------------------------------------------------------------
 # App setup
@@ -86,8 +91,8 @@ app.add_middleware(
 N8N_WEBHOOK_SECRET = os.getenv("N8N_WEBHOOK_SECRET", "change-me")
 
 # TODO(workflow): move to your workflow-rules module.
-# Statuses from which a request may be submitted.
-SUBMITTABLE_STATUSES = {ChangeRequestStatus.DRAFT}
+# Statuses in which the requester may replace the CSV and (re)submit.
+EDITABLE_STATUSES = {ChangeRequestStatus.DRAFT, ChangeRequestStatus.VALIDATION_FAILED}
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -108,6 +113,21 @@ def require_user(db: Session, user_id: UUID, label: str = "User") -> UserORM:
     return user
 
 
+_last_audit_time = utcnow()
+
+
+def audit_timestamp() -> datetime:
+    """Strictly increasing timestamps, so audit events written in the same transaction
+    (e.g. SUBMITTED then VALIDATING) keep their order. PostgreSQL's now() would give
+    them all the same time."""
+    global _last_audit_time
+    ts = utcnow()
+    if ts <= _last_audit_time:
+        ts = _last_audit_time + timedelta(microseconds=1)
+    _last_audit_time = ts
+    return ts
+
+
 def record_audit(
     db: Session,
     cr: ChangeRequestORM,
@@ -125,6 +145,7 @@ def record_audit(
             previous_value=previous_value,
             new_value=new_value,
             event_metadata=metadata or None,
+            created_at=audit_timestamp(),
         )
     )
 
@@ -153,6 +174,45 @@ def record_decision(db: Session, cr: ChangeRequestORM, body: DecisionRequest, de
             comment=body.comment,
         )
     )
+
+
+def require_editable(cr: ChangeRequestORM, action: str) -> None:
+    if cr.status not in EDITABLE_STATUSES:
+        allowed = ", ".join(sorted(st.value for st in EDITABLE_STATUSES))
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"Cannot {action} a request in status {cr.status.value} (allowed: {allowed})")
+
+
+async def read_csv_or_error(file: UploadFile) -> tuple[list[ParsedRow], Optional[JSONResponse]]:
+    """Run the format checks. Returns (rows, None), or ([], a 422 response listing every problem)."""
+    raw = await file.read(MAX_FILE_BYTES + 1)
+    rows, issues, row_count = parse_csv(raw)
+    if not issues:
+        return rows, None
+    error = CsvUploadError(
+        message=f"The CSV has {len(issues)} problem(s). Fix them and upload it again.",
+        filename=file.filename, rows_checked=row_count, errors=issues,
+    )
+    return [], JSONResponse(status_code=422, content=error.model_dump(mode="json"))
+
+
+def to_items(rows: list[ParsedRow]) -> list[ChangeRequestItemORM]:
+    return [
+        ChangeRequestItemORM(
+            row_number=row.row_number,
+            salesforce_account_id=row.salesforce_account_id,
+            name=row.name,
+            email=row.email,
+            role=row.role,
+            object_type=row.object_type,
+            record_id=row.record_id,
+            field=row.field,
+            current_value=row.current_value,
+            new_value=row.new_value,
+            issues=[],
+        )
+        for row in rows
+    ]
 
 
 def save(db: Session, obj: Any) -> Any:
@@ -252,15 +312,9 @@ async def upload_change_request(
     POST /change-requests/{id}/submit.
     """
     require_user(db, requester_id, "Requester")
-
-    raw = await file.read(MAX_FILE_BYTES + 1)
-    rows, issues, row_count = parse_csv(raw)
-    if issues:
-        error = CsvUploadError(
-            message=f"The CSV has {len(issues)} problem(s). Fix them and upload it again.",
-            filename=file.filename, rows_checked=row_count, errors=issues,
-        )
-        return JSONResponse(status_code=422, content=error.model_dump(mode="json"))
+    rows, error = await read_csv_or_error(file)
+    if error:
+        return error
 
     cr = ChangeRequestORM(
         title=title,
@@ -272,19 +326,7 @@ async def upload_change_request(
         requester_id=requester_id,
         status=ChangeRequestStatus.DRAFT,
     )
-    for row in rows:
-        cr.items.append(ChangeRequestItemORM(
-            row_number=row.row_number,
-            salesforce_account_id=row.salesforce_account_id,
-            name=row.name,
-            email=row.email,
-            role=row.role,
-            country=row.country,
-            industry=row.industry,
-            account_owner=row.account_owner,
-            amount=row.amount,
-            record_status=row.record_status,
-        ))
+    cr.items.extend(to_items(rows))
     db.add(cr)
     db.flush()  # assigns the id so the audit event can reference it
     record_audit(db, cr, AuditEventType.CREATED, requester_id, new_value=cr.status.value,
@@ -349,29 +391,108 @@ def ai_analyze(id: UUID, db: Session = Depends(get_db)):
 
 @app.get("/change-requests/{id}/items", response_model=list[ChangeRequestItem], tags=["change-requests"])
 def list_items(id: UUID, db: Session = Depends(get_db)):
-    """The accounts uploaded with this request, in CSV order."""
+    """The uploaded changes in CSV order, each with the problems found by the latest validation."""
     return get_or_404(db, id).items
 
 
-@app.post("/change-requests/{id}/submit", response_model=ChangeRequest, tags=["actions"])
-def submit(id: UUID, body: ActorRequest, db: Session = Depends(get_db)):
-    """Submit a draft: DRAFT -> SUBMITTED (recorded in the audit trail)."""
+@app.put(
+    "/change-requests/{id}/csv",
+    response_model=ChangeRequestDetail,
+    tags=["change-requests"],
+    responses={422: {"model": CsvUploadError, "description": "The CSV was rejected; nothing was changed"}},
+)
+async def replace_csv(
+    id: UUID,
+    file: UploadFile = File(..., description="The corrected template (.csv)"),
+    actor_id: Optional[UUID] = Form(None, description="Who uploads it; defaults to the requester"),
+    db: Session = Depends(get_db),
+):
+    """Replace the changes of a DRAFT or VALIDATION_FAILED request with a corrected CSV.
+
+    A VALIDATION_FAILED request goes back to DRAFT, ready to be submitted again.
+    """
     cr = get_or_404(db, id)
-    if cr.status not in SUBMITTABLE_STATUSES:
-        allowed = ", ".join(sorted(st.value for st in SUBMITTABLE_STATUSES))
-        raise HTTPException(status.HTTP_409_CONFLICT,
-                            f"Cannot submit a request in status {cr.status.value} (allowed: {allowed})")
+    require_editable(cr, "replace the CSV of")
+    actor = actor_id or cr.requester_id
+    require_user(db, actor, "Actor")
+    rows, error = await read_csv_or_error(file)
+    if error:
+        return error
+
+    cr.items.clear()
+    db.flush()  # delete the old rows first, so the unique constraint isn't hit
+    cr.items.extend(to_items(rows))
+    cr.requested_change = summarise(rows)
+    record_audit(db, cr, AuditEventType.CSV_UPLOADED, actor, new_value=file.filename, rows=len(rows))
+    if cr.status != ChangeRequestStatus.DRAFT:
+        set_status(db, cr, ChangeRequestStatus.DRAFT, AuditEventType.STATUS_CHANGED, actor,
+                   reason="Corrected CSV uploaded")
+    return save(db, cr)
+
+
+@app.post("/change-requests/{id}/submit", response_model=SubmitResponse, tags=["actions"])
+def submit(id: UUID, body: ActorRequest, db: Session = Depends(get_db)):
+    """Submit and validate a request.
+
+    DRAFT (or VALIDATION_FAILED) -> SUBMITTED -> VALIDATING -> READY_FOR_APPROVAL or
+    VALIDATION_FAILED. Every status change is recorded in the audit trail; the
+    report is returned here and also kept for GET /change-requests/{id}/validation.
+    Each item's `issues` shows the problems found on that row.
+    """
+    cr = get_or_404(db, id)
+    require_editable(cr, "submit")
     if not cr.items:
-        raise HTTPException(422, "This request has no accounts. Create it by uploading a CSV "
+        raise HTTPException(422, "This request has no changes. Create it by uploading a CSV "
                                  "to POST /change-requests/upload.")
     require_user(db, body.actor_id, "Actor")
 
     set_status(db, cr, ChangeRequestStatus.SUBMITTED, AuditEventType.SUBMITTED,
                body.actor_id, comment=body.comment)
+    set_status(db, cr, ChangeRequestStatus.VALIDATING, AuditEventType.STATUS_CHANGED, "system")
+    db.commit()  # other requests now see this one as in progress while it is checked
+
+    items = list(cr.items)
+    try:
+        issues = validate_request(db, cr.account_id, items)
+    except Exception as exc:  # never leave a request stuck in VALIDATING
+        db.rollback()
+        issues = [ValidationIssue(code="validation_error",
+                                  message=f"Validation could not be completed: {exc}. Try submitting again.")]
+    report = ValidationReport.build(cr.account_id, len(items), issues)
+
+    by_row: dict[int, list[dict]] = {}
+    for issue in issues:
+        if issue.row is not None:
+            by_row.setdefault(issue.row, []).append(issue.model_dump(mode="json"))
+    for item in items:
+        item.issues = by_row.get(item.row_number, [])
+
+    if report.valid:
+        outcome, event = ChangeRequestStatus.READY_FOR_APPROVAL, AuditEventType.VALIDATION_PASSED
+    else:
+        outcome, event = ChangeRequestStatus.VALIDATION_FAILED, AuditEventType.VALIDATION_FAILED
+    set_status(db, cr, outcome, event, "system", errors=report.error_count,
+               warnings=report.warning_count, report=report.model_dump(mode="json"))
     save(db, cr)
-    # TODO(workflow): trigger validation here (e.g. notify n8n), which moves the request on
-    # to VALIDATING -> READY_FOR_APPROVAL or VALIDATION_FAILED.
-    return cr
+    # TODO(workflow): notify n8n here, e.g. to route READY_FOR_APPROVAL requests to an approver.
+    return SubmitResponse(change_request=ChangeRequest.model_validate(cr), validation=report)
+
+
+@app.get("/change-requests/{id}/validation", response_model=ValidationReport, tags=["change-requests"])
+def latest_validation(id: UUID, db: Session = Depends(get_db)):
+    """The report from the latest validation (kept in the audit trail)."""
+    get_or_404(db, id)
+    event = db.scalar(
+        select(AuditEventORM)
+        .where(AuditEventORM.change_request_id == id)
+        .where(AuditEventORM.event_type.in_([AuditEventType.VALIDATION_PASSED,
+                                             AuditEventType.VALIDATION_FAILED]))
+        .order_by(AuditEventORM.created_at.desc())
+        .limit(1)
+    )
+    if event is None or not event.event_metadata or "report" not in event.event_metadata:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "This request hasn't been validated yet.")
+    return event.event_metadata["report"]
 
 
 @app.post("/change-requests/{id}/assign", response_model=ChangeRequest, tags=["actions"])

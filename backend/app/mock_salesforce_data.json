@@ -1,0 +1,44 @@
+{
+  "Account": {
+    "0015g00000AbCdEAAV": {
+      "Name": "Acme GmbH",
+      "BillingCountry": "Germany",
+      "Industry": null,
+      "OwnerId": "0055g00000XyZaBAAV"
+    },
+    "0015g00000AbCdFAAV": {
+      "Name": "Globex AG",
+      "BillingCountry": "Germany",
+      "Industry": "Banking",
+      "OwnerId": "0055g00000XyZaBAAV"
+    },
+    "0015g00000AbCdGAAV": {
+      "Name": "Initech",
+      "BillingCountry": "France",
+      "Industry": "Technology",
+      "OwnerId": "0055g00000QrStUAAV"
+    }
+  },
+  "Opportunity": {
+    "0065g00000LmNoPAAV": {
+      "Name": "Acme - 2027 renewal",
+      "AccountId": "0015g00000AbCdEAAV",
+      "Amount": 12000
+    },
+    "0065g00000LmNoQAAV": {
+      "Name": "Globex - expansion",
+      "AccountId": "0015g00000AbCdFAAV",
+      "Amount": 48000.5
+    }
+  },
+  "Lead": {
+    "00Q5g00000HiJkLEAV": {
+      "Name": "Maria Lopez",
+      "Status": "Open - Not Contacted"
+    },
+    "00Q5g00000HiJkMEAV": {
+      "Name": "Tom Becker",
+      "Status": "Working - Contacted"
+    }
+  }
+}

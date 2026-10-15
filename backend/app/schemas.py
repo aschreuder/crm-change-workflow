@@ -8,7 +8,6 @@ Each table has a Create model (request body), and a full model (response / store
 from __future__ import annotations
 
 from datetime import datetime, timezone
-from decimal import Decimal
 from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
@@ -222,29 +221,56 @@ class ImplementRequest(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# change_request_items (one row of the uploaded CSV = one Salesforce account)
+# Validation issues
 # ---------------------------------------------------------------------------
 
 
+class IssueSeverity(str, Enum):
+    ERROR = "error"      # blocks the request
+    WARNING = "warning"  # shown to the user, does not block
+
+
+class ValidationIssue(BaseModel):
+    """One problem found in an uploaded CSV or during validation."""
+    row: Optional[int] = None      # CSV line number (header = line 1); None = whole file/request
+    column: Optional[str] = None
+    code: str                      # machine-readable, e.g. "missing_value", "stale_current_value"
+    message: str                   # human-readable explanation
+    severity: IssueSeverity = IssueSeverity.ERROR
+
+
+# ---------------------------------------------------------------------------
+# change_request_items (one row of the uploaded CSV = one field change)
+# ---------------------------------------------------------------------------
+
+
+class SalesforceObject(str, Enum):
+    ACCOUNT = "Account"
+    OPPORTUNITY = "Opportunity"
+    LEAD = "Lead"
+
+
 class ChangeRequestItem(ORMModel):
-    """One uploaded CSV row. The four identifying fields are always filled in;
-    the five changeable fields are None when the row doesn't change them."""
+    """One uploaded CSV row: a single field change on a single Salesforce record."""
     account_id: UUID                 # primary key of this item
     change_request_id: UUID          # FK -> change_requests.account_id
     row_number: int                  # line in the CSV (header = line 1)
 
-    # Identifying fields (mandatory in the CSV)
-    salesforce_account_id: str       # the CSV's account_id column
+    # Who/what the change is about (mandatory in the CSV)
+    salesforce_account_id: str       # the CSV's account_id column (18-character Salesforce ID)
     name: str
     email: str
     role: str
 
-    # Changeable fields (optional in the CSV; None = no change)
-    country: Optional[str] = None
-    industry: Optional[str] = None
-    account_owner: Optional[str] = None
-    amount: Optional[Decimal] = None
-    record_status: Optional[str] = None  # the CSV's status column
+    # The change itself
+    object_type: SalesforceObject    # the CSV's object column
+    record_id: str                   # 18-character Salesforce ID of the record to change
+    field: str                       # country, industry, account_owner, amount or status
+    current_value: str               # what Salesforce should have now ("" = blank)
+    new_value: str
+
+    # Problems found by the latest validation (empty when the row passed)
+    issues: list[ValidationIssue] = Field(default_factory=list)
 
 
 class ChangeRequestDetail(ChangeRequest):
@@ -252,20 +278,42 @@ class ChangeRequestDetail(ChangeRequest):
     items: list[ChangeRequestItem] = Field(default_factory=list)
 
 
-class CsvIssue(BaseModel):
-    """One problem found in an uploaded CSV."""
-    row: Optional[int] = None      # CSV line number (header = line 1); None = whole file
-    column: Optional[str] = None
-    code: str                      # machine-readable, e.g. "missing_value", "duplicate_account"
-    message: str                   # human-readable explanation
-
-
 class CsvUploadError(BaseModel):
     """422 response body when an uploaded CSV is rejected. Nothing is stored."""
     message: str
     filename: Optional[str] = None
     rows_checked: int
-    errors: list[CsvIssue]
+    errors: list[ValidationIssue]
+
+
+class ValidationReport(BaseModel):
+    """Result of validating a submitted request."""
+    change_request_id: UUID
+    valid: bool
+    rows_checked: int
+    error_count: int
+    warning_count: int
+    issues: list[ValidationIssue]
+    checked_at: datetime = Field(default_factory=utcnow)
+
+    @classmethod
+    def build(cls, change_request_id: UUID, rows_checked: int,
+              issues: list[ValidationIssue]) -> "ValidationReport":
+        errors = sum(i.severity == IssueSeverity.ERROR for i in issues)
+        return cls(
+            change_request_id=change_request_id,
+            valid=errors == 0,
+            rows_checked=rows_checked,
+            error_count=errors,
+            warning_count=len(issues) - errors,
+            issues=sorted(issues, key=lambda i: (i.row or 0, i.column or "")),
+        )
+
+
+class SubmitResponse(BaseModel):
+    """POST /change-requests/{id}/submit: the request after validation, plus the report."""
+    change_request: ChangeRequest
+    validation: ValidationReport
 
 
 class N8nRequestSubmittedPayload(BaseModel):
