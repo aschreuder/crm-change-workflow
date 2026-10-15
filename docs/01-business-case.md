@@ -6,8 +6,8 @@ Typical requests:
 - Reassigning account owners
 - Correcting account countries
 - Updating account industries
-- Changing account tiers
-- Changing lifecycle stages
+- Changing amount (opportunity object)
+- Changing status (Lead Object)
 
 Proposed solution:
 Users submit a structured CSV of requested account changes. The system:

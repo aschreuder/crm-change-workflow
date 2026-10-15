@@ -1,0 +1,29 @@
+{
+  "Account": {
+    "0015g00000AbCdEAAV": {
+      "OwnerId": "0055g00000XyZaBAAV",
+      "BillingCountry": "Germany",
+      "Industry": null
+    },
+    "0015g00000AbCdFAAV": {
+      "OwnerId": "0055g00000XyZaBAAV",
+      "BillingCountry": "Germany",
+      "Industry": "Banking"
+    },
+    "0015g00000AbCdGAAV": {
+      "OwnerId": "0055g00000QrStUAAV",
+      "BillingCountry": "France",
+      "Industry": null
+    }
+  },
+  "Opportunity": {
+    "0065g00000LmNoPAAV": {
+      "Amount": "12000"
+    }
+  },
+  "Lead": {
+    "00Q5g00000HiJkLEAV": {
+      "Status": "Open - Not Contacted"
+    }
+  }
+}

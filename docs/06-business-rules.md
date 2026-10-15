@@ -10,8 +10,8 @@ Only these fields may be changed: <br>
 country <br>
 industry <br>
 account_owner <br>
-account_tier <br>
-lifecycle_stage <br>
+amount <br>
+status <br>
 
 BR-004: Owner changes <br>
 Any account_owner change requires business approval.
