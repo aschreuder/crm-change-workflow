@@ -1,26 +1,31 @@
 """
 PostgreSQL connection, sessions and tables (SQLAlchemy 2.0).
- 
+
 Start the database:   docker compose up -d
 Create the tables:    python database.py
- 
+
 The connection settings come from .env (see .env.example).
 """
- 
+
 from __future__ import annotations
- 
+
 import os
 import uuid
 from collections.abc import Generator
 from datetime import datetime
 from enum import Enum as PyEnum
 from typing import Any, Optional
- 
+
 from dotenv import load_dotenv
-from sqlalchemy import DateTime, Enum, ForeignKey, String, Text, create_engine, func, text
+from decimal import Decimal
+
+from sqlalchemy import (
+    DateTime, Enum, ForeignKey, Integer, Numeric, String, Text, UniqueConstraint, create_engine,
+    func, inspect, text,
+)
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
- 
+
 from schemas import (
     AuditEventType,
     ChangeRequestStatus,
@@ -29,14 +34,14 @@ from schemas import (
     RiskLevel,
     UserRole,
 )
- 
+
 # ---------------------------------------------------------------------------
 # Connection
 # ---------------------------------------------------------------------------
- 
+
 load_dotenv()
- 
- 
+
+
 def build_database_url() -> str:
     if url := os.getenv("DATABASE_URL"):
         return url
@@ -46,22 +51,22 @@ def build_database_url() -> str:
     port = os.getenv("POSTGRES_PORT", "5432")
     name = os.getenv("POSTGRES_DB", "change_requests")
     return f"postgresql+psycopg://{user}:{password}@{host}:{port}/{name}"
- 
- 
+
+
 DATABASE_URL = build_database_url()
- 
+
 engine = create_engine(
     DATABASE_URL,
     pool_pre_ping=True,  # drop dead connections, e.g. after the container restarts
     echo=os.getenv("SQL_ECHO", "false").lower() == "true",
 )
- 
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
- 
- 
+
+
 def get_db() -> Generator[Session, None, None]:
     """FastAPI dependency: one session per request.
- 
+
     Usage in a route:
         def list_requests(db: Session = Depends(get_db)): ...
     """
@@ -70,8 +75,8 @@ def get_db() -> Generator[Session, None, None]:
         yield db
     finally:
         db.close()
- 
- 
+
+
 def check_connection() -> bool:
     """Return True if the database answers. Useful for /health."""
     try:
@@ -80,40 +85,40 @@ def check_connection() -> bool:
         return True
     except Exception:
         return False
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Tables
 # ---------------------------------------------------------------------------
- 
- 
+
+
 class Base(DeclarativeBase):
     pass
- 
- 
+
+
 def pg_enum(enum_cls: type[PyEnum], name: str) -> Enum:
     """Store the enum's value (e.g. "Needs info") rather than its name (NEEDS_INFO)."""
     return Enum(enum_cls, name=name, values_callable=lambda e: [m.value for m in e])
- 
- 
+
+
 def uuid_pk() -> Mapped[uuid.UUID]:
     return mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
- 
- 
+
+
 class UserORM(Base):
     __tablename__ = "users"
- 
+
     account_id: Mapped[uuid.UUID] = uuid_pk()
     name: Mapped[str] = mapped_column(String(200), nullable=False)
     email: Mapped[str] = mapped_column(String(320), unique=True, nullable=False)
     role: Mapped[UserRole] = mapped_column(
         pg_enum(UserRole, "user_role"), nullable=False, default=UserRole.REQUESTER
     )
- 
- 
+
+
 class ChangeRequestORM(Base):
     __tablename__ = "change_requests"
- 
+
     account_id: Mapped[uuid.UUID] = uuid_pk()
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     description: Mapped[Optional[str]] = mapped_column(Text)
@@ -142,7 +147,7 @@ class ChangeRequestORM(Base):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now(), onupdate=func.now()
     )
- 
+
     requester: Mapped[UserORM] = relationship(foreign_keys=[requester_id])
     assigned_approver: Mapped[Optional[UserORM]] = relationship(foreign_keys=[assigned_approver_id])
     decisions: Mapped[list[ApprovalDecisionORM]] = relationship(
@@ -153,11 +158,50 @@ class ChangeRequestORM(Base):
         cascade="all, delete-orphan",
         order_by="AuditEventORM.created_at",
     )
- 
- 
+    items: Mapped[list[ChangeRequestItemORM]] = relationship(
+        back_populates="change_request",
+        cascade="all, delete-orphan",
+        order_by="ChangeRequestItemORM.row_number",
+    )
+
+
+class ChangeRequestItemORM(Base):
+    """One uploaded CSV row: one Salesforce account and the fields to change on it.
+
+    The changeable columns are NULL when the row doesn't change that field.
+    """
+    __tablename__ = "change_request_items"
+    __table_args__ = (
+        # Each account appears at most once per request.
+        UniqueConstraint("change_request_id", "salesforce_account_id",
+                         name="uq_item_account_per_request"),
+    )
+
+    account_id: Mapped[uuid.UUID] = uuid_pk()
+    change_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("change_requests.account_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    row_number: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    # Identifying fields (mandatory in the CSV)
+    salesforce_account_id: Mapped[str] = mapped_column(String(18), nullable=False, index=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    email: Mapped[str] = mapped_column(String(320), nullable=False)
+    role: Mapped[str] = mapped_column(String(100), nullable=False)
+
+    # Changeable fields (NULL = no change)
+    country: Mapped[Optional[str]] = mapped_column(String(80))
+    industry: Mapped[Optional[str]] = mapped_column(String(80))
+    account_owner: Mapped[Optional[str]] = mapped_column(String(200))
+    amount: Mapped[Optional[Decimal]] = mapped_column(Numeric(18, 2))
+    record_status: Mapped[Optional[str]] = mapped_column(String(100))  # the CSV's status column
+
+    change_request: Mapped[ChangeRequestORM] = relationship(back_populates="items")
+
+
 class ApprovalDecisionORM(Base):
     __tablename__ = "approval_decisions"
- 
+
     account_id: Mapped[uuid.UUID] = uuid_pk()
     change_request_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("change_requests.account_id", ondelete="CASCADE"), nullable=False, index=True
@@ -168,14 +212,14 @@ class ApprovalDecisionORM(Base):
     decided_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
- 
+
     change_request: Mapped[ChangeRequestORM] = relationship(back_populates="decisions")
     approver: Mapped[UserORM] = relationship()
- 
- 
+
+
 class AuditEventORM(Base):
     __tablename__ = "audit_events"
- 
+
     account_id: Mapped[uuid.UUID] = uuid_pk()
     change_request_id: Mapped[uuid.UUID] = mapped_column(
         ForeignKey("change_requests.account_id", ondelete="CASCADE"), nullable=False, index=True
@@ -190,22 +234,65 @@ class AuditEventORM(Base):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
- 
+
     change_request: Mapped[ChangeRequestORM] = relationship(back_populates="audit_events")
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Setup
 # ---------------------------------------------------------------------------
- 
- 
+
+
 def init_db() -> None:
-    """Create any tables that don't exist yet. Existing tables are left alone."""
+    """Create any tables that don't exist yet, and add new enum values to existing enum types.
+
+    Existing tables are otherwise left alone: column changes need a migration tool (Alembic).
+    """
+    check_items_table_is_current()
     Base.metadata.create_all(bind=engine)
- 
- 
+    sync_enum_values()
+
+
+def check_items_table_is_current() -> None:
+    """Stop with clear instructions if change_request_items still has the old
+    one-row-per-field-change columns (create_all() can't change an existing table)."""
+    if not inspect(engine).has_table("change_request_items"):
+        return
+    columns = {c["name"] for c in inspect(engine).get_columns("change_request_items")}
+    if "salesforce_account_id" not in columns:
+        raise RuntimeError(
+            "The change_request_items table has the old CSV layout. Its rows can't be used with the "
+            "new template, so remove it and restart (the table is recreated automatically):\n"
+            "    docker exec -it change-requests-db psql -U cr_user -d change_requests "
+            "-c 'DROP TABLE change_request_items;'"
+        )
+
+
+def sync_enum_values() -> None:
+    """create_all() doesn't add values to enum types that already exist, so do it here.
+
+    Example: adding AuditEventType.CSV_UPLOADED to schemas.py after the database was created.
+    """
+    enum_types = {
+        col.type.name: col.type.enums
+        for table in Base.metadata.tables.values()
+        for col in table.columns
+        if isinstance(col.type, Enum) and col.type.name
+    }
+    with engine.begin() as conn:
+        for type_name, values in enum_types.items():
+            existing = set(conn.scalars(
+                text("SELECT e.enumlabel FROM pg_enum e JOIN pg_type t ON t.oid = e.enumtypid "
+                     "WHERE t.typname = :name"), {"name": type_name}))
+            for value in values:
+                if value not in existing:
+                    conn.execute(text(f'ALTER TYPE "{type_name}" ADD VALUE IF NOT EXISTS :v'
+                                      .replace(":v", "'" + value.replace("'", "''") + "'")))
+
+
 if __name__ == "__main__":
     if not check_connection():
         raise SystemExit(f"Cannot reach the database at {engine.url!r}. Is `docker compose up -d` running?")
     init_db()
     print("Tables ready:", ", ".join(Base.metadata.tables))
+    

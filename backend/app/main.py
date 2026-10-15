@@ -1,31 +1,35 @@
 """
 Change Request Management API (FastAPI + PostgreSQL)
- 
+
 Start the database:  docker compose up -d
 Run the API:         uvicorn main:app --reload
 Docs:                http://127.0.0.1:8000/docs
- 
-Schemas live in schemas.py, tables and the connection in database.py.
+
+Schemas live in schemas.py, tables and the connection in database.py, and the
+CSV template and its checks in csv_template.py.
 Workflow rules and AI assistance go in their own modules; the places to call
 them are marked with TODO below.
 """
- 
+
 from __future__ import annotations
- 
+
 import os
 from contextlib import asynccontextmanager
 from typing import Any, Optional
 from uuid import UUID
- 
-from fastapi import Depends, FastAPI, Header, HTTPException, Query, status
+
+from fastapi import Depends, FastAPI, File, Form, Header, HTTPException, Query, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
- 
+
+from csv_template import MAX_FILE_BYTES, parse_csv, summarise, template_csv
 from database import (
     ApprovalDecisionORM,
     AuditEventORM,
+    ChangeRequestItemORM,
     ChangeRequestORM,
     UserORM,
     check_connection,
@@ -39,63 +43,71 @@ from schemas import (
     AuditEventType,
     ChangeRequest,
     ChangeRequestCreate,
+    ChangeRequestDetail,
+    ChangeRequestItem,
     ChangeRequestStatus,
     ChangeRequestUpdate,
+    CsvUploadError,
     Decision,
     DecisionRequest,
     ImplementRequest,
     N8nRequestSubmittedPayload,
+    Priority,
     User,
     UserCreate,
     utcnow,
 )
- 
+
 # ---------------------------------------------------------------------------
 # App setup
 # ---------------------------------------------------------------------------
- 
- 
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()  # creates missing tables on startup
     yield
- 
- 
+
+
 app = FastAPI(
     title="Change Request API",
     version="1.0.0",
     description="Create, review, approve and track change requests.",
     lifespan=lifespan,
 )
- 
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=os.getenv("CORS_ORIGINS", "*").split(","),
     allow_methods=["*"],
     allow_headers=["*"],
 )
- 
+
 N8N_WEBHOOK_SECRET = os.getenv("N8N_WEBHOOK_SECRET", "change-me")
- 
+
+# TODO(workflow): move to your workflow-rules module.
+# Statuses from which a request may be submitted.
+SUBMITTABLE_STATUSES = {ChangeRequestStatus.DRAFT}
+
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
- 
- 
+
+
 def get_or_404(db: Session, cr_id: UUID) -> ChangeRequestORM:
     cr = db.get(ChangeRequestORM, cr_id)
     if cr is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"Change request {cr_id} not found")
     return cr
- 
- 
+
+
 def require_user(db: Session, user_id: UUID, label: str = "User") -> UserORM:
     user = db.get(UserORM, user_id)
     if user is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, f"{label} {user_id} not found")
     return user
- 
- 
+
+
 def record_audit(
     db: Session,
     cr: ChangeRequestORM,
@@ -115,8 +127,8 @@ def record_audit(
             event_metadata=metadata or None,
         )
     )
- 
- 
+
+
 def set_status(
     db: Session,
     cr: ChangeRequestORM,
@@ -129,8 +141,8 @@ def set_status(
     previous = cr.status
     cr.status = new_status
     record_audit(db, cr, event_type, actor_id, previous.value, new_status.value, **metadata)
- 
- 
+
+
 def record_decision(db: Session, cr: ChangeRequestORM, body: DecisionRequest, decision: Decision) -> None:
     require_user(db, body.approver_id, "Approver")
     db.add(
@@ -141,31 +153,31 @@ def record_decision(db: Session, cr: ChangeRequestORM, body: DecisionRequest, de
             comment=body.comment,
         )
     )
- 
- 
+
+
 def save(db: Session, obj: Any) -> Any:
     """Commit the session and reload the object so DB-set fields (timestamps) are current."""
     db.commit()
     db.refresh(obj)
     return obj
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # System
 # ---------------------------------------------------------------------------
- 
- 
+
+
 @app.get("/health", tags=["system"])
 def health():
     db_ok = check_connection()
     return {"status": "ok" if db_ok else "degraded", "database": db_ok, "timestamp": utcnow()}
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Users (needed because change requests reference real users)
 # ---------------------------------------------------------------------------
- 
- 
+
+
 @app.post("/users", response_model=User, status_code=status.HTTP_201_CREATED, tags=["users"])
 def create_user(body: UserCreate, db: Session = Depends(get_db)):
     user = UserORM(**body.model_dump())
@@ -177,18 +189,34 @@ def create_user(body: UserCreate, db: Session = Depends(get_db)):
         raise HTTPException(status.HTTP_409_CONFLICT, f"A user with email {body.email} already exists")
     db.refresh(user)
     return user
- 
- 
+
+
 @app.get("/users", response_model=list[User], tags=["users"])
 def list_users(db: Session = Depends(get_db)):
     return db.scalars(select(UserORM).order_by(UserORM.name)).all()
- 
- 
+
+
+# ---------------------------------------------------------------------------
+# CSV template
+# ---------------------------------------------------------------------------
+
+
+@app.get("/templates/change-request.csv", tags=["csv"],
+         response_class=Response, responses={200: {"content": {"text/csv": {}}}})
+def download_template():
+    """The standard CSV template with example rows. Empty cells mean 'no change'."""
+    return Response(
+        content=template_csv(),
+        media_type="text/csv",
+        headers={"Content-Disposition": 'attachment; filename="change-request-template.csv"'},
+    )
+
+
 # ---------------------------------------------------------------------------
 # Change requests
 # ---------------------------------------------------------------------------
- 
- 
+
+
 @app.post("/change-requests", response_model=ChangeRequest,
           status_code=status.HTTP_201_CREATED, tags=["change-requests"])
 def create_change_request(body: ChangeRequestCreate, db: Session = Depends(get_db)):
@@ -198,8 +226,72 @@ def create_change_request(body: ChangeRequestCreate, db: Session = Depends(get_d
     db.flush()  # assigns the id so the audit event can reference it
     record_audit(db, cr, AuditEventType.CREATED, body.requester_id, new_value=cr.status.value)
     return save(db, cr)
- 
- 
+
+
+@app.post(
+    "/change-requests/upload",
+    response_model=ChangeRequestDetail,
+    status_code=status.HTTP_201_CREATED,
+    tags=["change-requests"],
+    responses={422: {"model": CsvUploadError, "description": "The CSV was rejected; nothing was stored"}},
+)
+async def upload_change_request(
+    file: UploadFile = File(..., description="The filled-in standard template (.csv)"),
+    requester_id: UUID = Form(...),
+    title: str = Form(..., min_length=3, max_length=200),
+    business_justification: str = Form(..., min_length=1),
+    description: Optional[str] = Form(None),
+    category: Optional[str] = Form(None),
+    priority: Optional[Priority] = Form(None),
+    db: Session = Depends(get_db),
+):
+    """Upload the standard CSV template and create a DRAFT change request from it.
+
+    The whole file is checked first. If anything is wrong, it is rejected (422) with
+    every problem listed and nothing is stored. Submit the draft afterwards with
+    POST /change-requests/{id}/submit.
+    """
+    require_user(db, requester_id, "Requester")
+
+    raw = await file.read(MAX_FILE_BYTES + 1)
+    rows, issues, row_count = parse_csv(raw)
+    if issues:
+        error = CsvUploadError(
+            message=f"The CSV has {len(issues)} problem(s). Fix them and upload it again.",
+            filename=file.filename, rows_checked=row_count, errors=issues,
+        )
+        return JSONResponse(status_code=422, content=error.model_dump(mode="json"))
+
+    cr = ChangeRequestORM(
+        title=title,
+        description=description,
+        business_justification=business_justification,
+        requested_change=summarise(rows),
+        category=category,
+        priority=priority,
+        requester_id=requester_id,
+        status=ChangeRequestStatus.DRAFT,
+    )
+    for row in rows:
+        cr.items.append(ChangeRequestItemORM(
+            row_number=row.row_number,
+            salesforce_account_id=row.salesforce_account_id,
+            name=row.name,
+            email=row.email,
+            role=row.role,
+            country=row.country,
+            industry=row.industry,
+            account_owner=row.account_owner,
+            amount=row.amount,
+            record_status=row.record_status,
+        ))
+    db.add(cr)
+    db.flush()  # assigns the id so the audit event can reference it
+    record_audit(db, cr, AuditEventType.CREATED, requester_id, new_value=cr.status.value,
+                 source="csv_upload", filename=file.filename, rows=len(rows))
+    return save(db, cr)
+
+
 @app.get("/change-requests", response_model=list[ChangeRequest], tags=["change-requests"])
 def list_change_requests(
     status_filter: Optional[ChangeRequestStatus] = Query(None, alias="status"),
@@ -217,13 +309,13 @@ def list_change_requests(
     if assigned_approver_id:
         query = query.where(ChangeRequestORM.assigned_approver_id == assigned_approver_id)
     return db.scalars(query.offset(skip).limit(limit)).all()
- 
- 
+
+
 @app.get("/change-requests/{id}", response_model=ChangeRequest, tags=["change-requests"])
 def get_change_request(id: UUID, db: Session = Depends(get_db)):
     return get_or_404(db, id)
- 
- 
+
+
 @app.patch("/change-requests/{id}", response_model=ChangeRequest, tags=["change-requests"])
 def update_change_request(id: UUID, body: ChangeRequestUpdate, db: Session = Depends(get_db)):
     cr = get_or_404(db, id)
@@ -236,13 +328,13 @@ def update_change_request(id: UUID, body: ChangeRequestUpdate, db: Session = Dep
     record_audit(db, cr, AuditEventType.UPDATED, body.actor_id or cr.requester_id,
                  changed_fields=list(changes))
     return save(db, cr)
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Actions
 # ---------------------------------------------------------------------------
- 
- 
+
+
 @app.post("/change-requests/{id}/ai-analyze", response_model=ChangeRequest, tags=["actions"])
 def ai_analyze(id: UUID, db: Session = Depends(get_db)):
     cr = get_or_404(db, id)
@@ -253,19 +345,35 @@ def ai_analyze(id: UUID, db: Session = Depends(get_db)):
     #   record_audit(db, cr, AuditEventType.AI_ANALYZED, "ai", model=result.model)
     #   return save(db, cr)
     raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "AI analysis is not connected yet")
- 
- 
+
+
+@app.get("/change-requests/{id}/items", response_model=list[ChangeRequestItem], tags=["change-requests"])
+def list_items(id: UUID, db: Session = Depends(get_db)):
+    """The accounts uploaded with this request, in CSV order."""
+    return get_or_404(db, id).items
+
+
 @app.post("/change-requests/{id}/submit", response_model=ChangeRequest, tags=["actions"])
 def submit(id: UUID, body: ActorRequest, db: Session = Depends(get_db)):
+    """Submit a draft: DRAFT -> SUBMITTED (recorded in the audit trail)."""
     cr = get_or_404(db, id)
-    # TODO(workflow): validate required fields before submitting.
+    if cr.status not in SUBMITTABLE_STATUSES:
+        allowed = ", ".join(sorted(st.value for st in SUBMITTABLE_STATUSES))
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"Cannot submit a request in status {cr.status.value} (allowed: {allowed})")
+    if not cr.items:
+        raise HTTPException(422, "This request has no accounts. Create it by uploading a CSV "
+                                 "to POST /change-requests/upload.")
+    require_user(db, body.actor_id, "Actor")
+
     set_status(db, cr, ChangeRequestStatus.SUBMITTED, AuditEventType.SUBMITTED,
                body.actor_id, comment=body.comment)
     save(db, cr)
-    # TODO(workflow): trigger the n8n validation workflow here.
+    # TODO(workflow): trigger validation here (e.g. notify n8n), which moves the request on
+    # to VALIDATING -> READY_FOR_APPROVAL or VALIDATION_FAILED.
     return cr
- 
- 
+
+
 @app.post("/change-requests/{id}/assign", response_model=ChangeRequest, tags=["actions"])
 def assign(id: UUID, body: AssignRequest, db: Session = Depends(get_db)):
     cr = get_or_404(db, id)
@@ -274,8 +382,8 @@ def assign(id: UUID, body: AssignRequest, db: Session = Depends(get_db)):
     cr.assigned_approver_id = body.approver_id
     record_audit(db, cr, AuditEventType.ASSIGNED, body.actor_id, previous, str(body.approver_id))
     return save(db, cr)
- 
- 
+
+
 @app.post("/change-requests/{id}/request-information", response_model=ChangeRequest, tags=["actions"])
 def request_information(id: UUID, body: DecisionRequest, db: Session = Depends(get_db)):
     cr = get_or_404(db, id)
@@ -283,8 +391,8 @@ def request_information(id: UUID, body: DecisionRequest, db: Session = Depends(g
     set_status(db, cr, ChangeRequestStatus.DRAFT, AuditEventType.INFORMATION_REQUESTED,
                body.approver_id, comment=body.comment)
     return save(db, cr)
- 
- 
+
+
 @app.post("/change-requests/{id}/approve", response_model=ChangeRequest, tags=["actions"])
 def approve(id: UUID, body: DecisionRequest, db: Session = Depends(get_db)):
     cr = get_or_404(db, id)
@@ -292,8 +400,8 @@ def approve(id: UUID, body: DecisionRequest, db: Session = Depends(get_db)):
     set_status(db, cr, ChangeRequestStatus.APPROVED, AuditEventType.APPROVED,
                body.approver_id, comment=body.comment)
     return save(db, cr)
- 
- 
+
+
 @app.post("/change-requests/{id}/reject", response_model=ChangeRequest, tags=["actions"])
 def reject(id: UUID, body: DecisionRequest, db: Session = Depends(get_db)):
     cr = get_or_404(db, id)
@@ -301,29 +409,29 @@ def reject(id: UUID, body: DecisionRequest, db: Session = Depends(get_db)):
     set_status(db, cr, ChangeRequestStatus.REJECTED, AuditEventType.REJECTED,
                body.approver_id, comment=body.comment)
     return save(db, cr)
- 
- 
+
+
 @app.post("/change-requests/{id}/implement", response_model=ChangeRequest, tags=["actions"])
 def implement(id: UUID, body: ImplementRequest, db: Session = Depends(get_db)):
     cr = get_or_404(db, id)
     set_status(db, cr, ChangeRequestStatus(body.outcome.value), AuditEventType.IMPLEMENTED,
                body.actor_id, notes=body.notes)
     return save(db, cr)
- 
- 
+
+
 @app.post("/change-requests/{id}/close", response_model=ChangeRequest, tags=["actions"])
 def close(id: UUID, body: ActorRequest, db: Session = Depends(get_db)):
     cr = get_or_404(db, id)
     # There is no CLOSED status, so closing is recorded in the audit trail only.
     record_audit(db, cr, AuditEventType.CLOSED, body.actor_id, comment=body.comment)
     return save(db, cr)
- 
- 
+
+
 # ---------------------------------------------------------------------------
 # Audit & webhooks
 # ---------------------------------------------------------------------------
- 
- 
+
+
 @app.get("/change-requests/{id}/audit-events", response_model=list[AuditEvent], tags=["audit"])
 def get_audit_events(id: UUID, db: Session = Depends(get_db)):
     get_or_404(db, id)
@@ -333,8 +441,8 @@ def get_audit_events(id: UUID, db: Session = Depends(get_db)):
         .order_by(AuditEventORM.created_at)
     )
     return db.scalars(query).all()
- 
- 
+
+
 @app.post("/webhooks/n8n/request-submitted", tags=["webhooks"])
 def n8n_request_submitted(
     payload: N8nRequestSubmittedPayload,
@@ -352,5 +460,3 @@ def n8n_request_submitted(
                      workflow_id=payload.workflow_id, data=payload.data)
     save(db, cr)
     return {"received": True, "change_request_id": cr.account_id, "status": cr.status}
- 
-
