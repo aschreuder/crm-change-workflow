@@ -7,12 +7,14 @@ Docs:                http://127.0.0.1:8000/docs
 
 Schemas live in schemas.py, tables and the connection in database.py, and the
 CSV template and its checks in csv_template.py.
-Workflow rules and AI assistance go in their own modules; the places to call
-them are marked with TODO below.
+Validation lives in validation.py and business_rules.py, the AI analysis in
+ai_analysis.py. Workflow rules go in their own module; the places to call them
+are marked with TODO below.
 """
 
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime, timedelta
@@ -28,6 +30,7 @@ from sqlalchemy.orm import Session
 
 from csv_template import MAX_FILE_BYTES, ParsedRow, parse_csv, summarise, template_csv
 from database import (
+    AIAnalysisORM,
     ApprovalDecisionORM,
     AuditEventORM,
     ChangeRequestItemORM,
@@ -38,6 +41,10 @@ from database import (
     init_db,
 )
 from schemas import (
+    AIAnalysis,
+    AIAnalysisConfirm,
+    AIAnalysisReject,
+    AIAnalysisStatus,
     ActorRequest,
     AssignRequest,
     AuditEvent,
@@ -61,6 +68,7 @@ from schemas import (
     ValidationReport,
     utcnow,
 )
+import ai_analysis
 import business_rules
 from validation import validate_request
 
@@ -214,6 +222,43 @@ def to_items(rows: list[ParsedRow]) -> list[ChangeRequestItemORM]:
         )
         for row in rows
     ]
+
+
+def supersede_pending_analyses(cr: ChangeRequestORM) -> None:
+    """An unreviewed analysis is out of date once a new one runs or the CSV changes."""
+    for analysis in cr.ai_analyses:
+        if analysis.status == AIAnalysisStatus.PENDING_REVIEW:
+            analysis.status = AIAnalysisStatus.SUPERSEDED
+
+
+def get_analysis_or_404(db: Session, cr_id: UUID, analysis_id: UUID) -> AIAnalysisORM:
+    analysis = db.get(AIAnalysisORM, analysis_id)
+    if analysis is None or analysis.change_request_id != cr_id:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, f"AI analysis {analysis_id} not found for this request")
+    return analysis
+
+
+def review_preconditions(db: Session, cr_id: UUID, analysis_id: UUID,
+                         actor_id: UUID) -> tuple[ChangeRequestORM, AIAnalysisORM]:
+    """Only the requester may review, only once, and only while the request is still editable."""
+    cr = get_or_404(db, cr_id)
+    analysis = get_analysis_or_404(db, cr_id, analysis_id)
+    require_user(db, actor_id, "Actor")
+    if actor_id != cr.requester_id:
+        raise HTTPException(status.HTTP_403_FORBIDDEN, "Only the requester can confirm or reject the AI analysis")
+    require_editable(cr, "review the AI analysis of")
+    if analysis.status != AIAnalysisStatus.PENDING_REVIEW:
+        raise HTTPException(status.HTTP_409_CONFLICT,
+                            f"This analysis is {analysis.status.value} and can no longer be reviewed")
+    return cr, analysis
+
+
+def finish_review(analysis: AIAnalysisORM, outcome: AIAnalysisStatus, actor_id: UUID,
+                  comment: Optional[str]) -> None:
+    analysis.status = outcome
+    analysis.reviewed_by = actor_id
+    analysis.reviewed_at = utcnow()
+    analysis.review_comment = comment
 
 
 def save(db: Session, obj: Any) -> Any:
@@ -378,16 +423,98 @@ def update_change_request(id: UUID, body: ChangeRequestUpdate, db: Session = Dep
 # ---------------------------------------------------------------------------
 
 
-@app.post("/change-requests/{id}/ai-analyze", response_model=ChangeRequest, tags=["actions"])
-def ai_analyze(id: UUID, db: Session = Depends(get_db)):
+@app.post("/change-requests/{id}/ai-analyze", response_model=AIAnalysis,
+          status_code=status.HTTP_201_CREATED, tags=["ai-analysis"],
+          responses={503: {"description": "The AI analysis couldn't be produced; nothing was stored"}})
+def ai_analyze(id: UUID, body: ActorRequest, db: Session = Depends(get_db)):
+    """Ask the AI to summarise and categorise the request, suggest a risk level and list
+    missing information.
+
+    The result is stored separately (GET /change-requests/{id}/ai-analyses) with status
+    PENDING_REVIEW and changes nothing on the request until the requester confirms it.
+    The request stays in DRAFT. Running it again replaces an unreviewed earlier analysis.
+    """
     cr = get_or_404(db, id)
-    # TODO(ai): call your AI module here and store its output, e.g.
-    #   result = analyze(cr)
-    #   cr.ai_summary = result.summary
-    #   cr.ai_missing_information = result.missing_information
-    #   record_audit(db, cr, AuditEventType.AI_ANALYZED, "ai", model=result.model)
-    #   return save(db, cr)
-    raise HTTPException(status.HTTP_501_NOT_IMPLEMENTED, "AI analysis is not connected yet")
+    require_editable(cr, "analyse")
+    if not cr.items:
+        raise HTTPException(422, "This request has no changes to analyse. Upload a CSV first.")
+    require_user(db, body.actor_id, "Actor")
+
+    try:
+        result = ai_analysis.analyse(cr)
+    except ai_analysis.AIUnavailable as exc:
+        raise HTTPException(status.HTTP_503_SERVICE_UNAVAILABLE, str(exc))
+
+    supersede_pending_analyses(cr)
+    out = result.output
+    analysis = AIAnalysisORM(
+        change_request_id=cr.account_id,
+        status=AIAnalysisStatus.PENDING_REVIEW,
+        summary=out.summary,
+        category=out.category,
+        category_reason=out.category_reason,
+        risk_level=out.risk_level,
+        risk_reasons=out.risk_reasons,
+        missing_information=out.missing_information,
+        model=result.model,
+        raw_output=out.model_dump(mode="json"),
+        requested_by=body.actor_id,
+    )
+    db.add(analysis)
+    db.flush()
+    record_audit(db, cr, AuditEventType.AI_ANALYZED, body.actor_id, new_value=str(analysis.account_id),
+                 model=result.model, category=out.category.value, risk_level=out.risk_level.value,
+                 missing_items=len(out.missing_information))
+    return save(db, analysis)
+
+
+@app.get("/change-requests/{id}/ai-analyses", response_model=list[AIAnalysis], tags=["ai-analysis"])
+def list_ai_analyses(id: UUID, db: Session = Depends(get_db)):
+    """All AI analyses of this request, newest first."""
+    return get_or_404(db, id).ai_analyses
+
+
+@app.get("/change-requests/{id}/ai-analyses/{analysis_id}", response_model=AIAnalysis, tags=["ai-analysis"])
+def get_ai_analysis(id: UUID, analysis_id: UUID, db: Session = Depends(get_db)):
+    return get_analysis_or_404(db, id, analysis_id)
+
+
+@app.post("/change-requests/{id}/ai-analyses/{analysis_id}/confirm", response_model=AIAnalysis,
+          tags=["ai-analysis"])
+def confirm_ai_analysis(id: UUID, analysis_id: UUID, body: AIAnalysisConfirm, db: Session = Depends(get_db)):
+    """The requester confirms the analysis, optionally correcting the category or risk level.
+
+    The confirmed category and risk level are copied onto the request. The request stays in DRAFT.
+    """
+    cr, analysis = review_preconditions(db, id, analysis_id, body.actor_id)
+    analysis.confirmed_category = body.category or analysis.category
+    analysis.confirmed_risk_level = body.risk_level or analysis.risk_level
+    finish_review(analysis, AIAnalysisStatus.CONFIRMED, body.actor_id, body.comment)
+
+    previous = {"category": cr.category, "risk_level": cr.risk_level.value if cr.risk_level else None}
+    cr.category = analysis.confirmed_category.value
+    cr.risk_level = analysis.confirmed_risk_level
+    record_audit(
+        db, cr, AuditEventType.AI_CONFIRMED, body.actor_id,
+        previous_value=json.dumps(previous),
+        new_value=json.dumps({"category": cr.category, "risk_level": cr.risk_level.value}),
+        analysis_id=str(analysis.account_id),
+        overridden=[f for f, v in (("category", body.category), ("risk_level", body.risk_level))
+                    if v is not None and v != getattr(analysis, f)],
+        comment=body.comment,
+    )
+    return save(db, analysis)
+
+
+@app.post("/change-requests/{id}/ai-analyses/{analysis_id}/reject", response_model=AIAnalysis,
+          tags=["ai-analysis"])
+def reject_ai_analysis(id: UUID, analysis_id: UUID, body: AIAnalysisReject, db: Session = Depends(get_db)):
+    """The requester rejects the analysis. Nothing on the request changes."""
+    cr, analysis = review_preconditions(db, id, analysis_id, body.actor_id)
+    finish_review(analysis, AIAnalysisStatus.REJECTED, body.actor_id, body.comment)
+    record_audit(db, cr, AuditEventType.AI_REJECTED, body.actor_id,
+                 analysis_id=str(analysis.account_id), comment=body.comment)
+    return save(db, analysis)
 
 
 @app.get("/change-requests/{id}/items", response_model=list[ChangeRequestItem], tags=["change-requests"])
@@ -426,6 +553,7 @@ async def replace_csv(
     cr.requested_change = summarise(rows)
     cr.requires_approval = None  # the old validation no longer applies
     cr.approval_reasons = None
+    supersede_pending_analyses(cr)  # an unreviewed AI analysis describes the old CSV
     record_audit(db, cr, AuditEventType.CSV_UPLOADED, actor, new_value=file.filename, rows=len(rows))
     if cr.status != ChangeRequestStatus.DRAFT:
         set_status(db, cr, ChangeRequestStatus.DRAFT, AuditEventType.STATUS_CHANGED, actor,

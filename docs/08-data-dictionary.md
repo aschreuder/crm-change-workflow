@@ -22,8 +22,6 @@
 | status                 | string          | Controlled status                                   |
 | requester_id           | foreign key     | Required                                            |
 | assigned_approver_id   | foreign key     | Nullable until routed                               |
-| ai_summary             | text            | Stored seperately                                   |
-| ai_missing_information | text            | AI recommendations                                  |
 | created_at             | timestamp       | Required                                            |
 | updated_at             | timestamp       | Required                                            |
 | requires approval      | text            | Required                                            |
@@ -52,3 +50,27 @@
 | new_value              | string          | optional                                            |
 | event_metadata         | string          | Workflow or AI metadata                             |
 | created_at             | timestamp       | Required                                            |
+
+### ai_analysis
+        Column        |           Type           | Notes       |
+----------------------+--------------------------+-------------|
+ account_id           | uuid                     | Primary key |
+ change_request_id    | uuid                     |             |
+ status               | ai_analysis_status       |             |
+ summary              | text                     |             |
+ category             | change_category          |             |
+ category_reason      | text                     |             |
+ risk_level           | risk_level               |             |
+ risk_reasons         | jsonb                    |             | 
+ missing_information  | jsonb                    |             | 
+ model                | character varying(100)   |             |
+ raw_output           | jsonb                    |             | 
+ requested_by         | uuid                     |             | 
+ created_at           | timestamp with time zone |             | 
+ reviewed_by          | uuid                     |             | 
+ reviewed_at          | timestamp with time zone |             | 
+ review_comment       | text                     |             |
+ confirmed_category   | change_category          |             |
+ confirmed_risk_level | risk_level               |             |
+
+

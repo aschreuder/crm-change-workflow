@@ -75,6 +75,8 @@ class AuditEventType(str, Enum):
     VALIDATION_PASSED = "Validation passed"
     VALIDATION_FAILED = "Validation failed"
     AI_ANALYZED = "AI analyzed"
+    AI_CONFIRMED = "AI analysis confirmed"
+    AI_REJECTED = "AI analysis rejected"
     SUBMITTED = "Submitted"
     STATUS_CHANGED = "Status changed"
     ASSIGNED = "Assigned"
@@ -151,8 +153,6 @@ class ChangeRequest(ORMModel):
     status: ChangeRequestStatus = ChangeRequestStatus.DRAFT
     requester_id: UUID  # FK -> users.account_id
     assigned_approver_id: Optional[UUID] = None  # FK -> users.account_id, null until routed
-    ai_summary: Optional[str] = None
-    ai_missing_information: Optional[str] = None
     requires_approval: Optional[bool] = None  # set by the business rules; None = not validated yet
     approval_reasons: list[ApprovalReason] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)
@@ -340,3 +340,71 @@ class N8nRequestSubmittedPayload(BaseModel):
     status: Optional[ChangeRequestStatus] = None  # e.g. VALIDATING, VALIDATION_FAILED, READY_FOR_APPROVAL
     workflow_id: Optional[str] = None
     data: dict[str, Any] = Field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# ai_analyses (stored separately from the change request)
+# ---------------------------------------------------------------------------
+
+
+class ChangeCategory(str, Enum):
+    """Categories the AI chooses from. Edit this list to match how your business groups changes."""
+    OWNERSHIP_TRANSFER = "Ownership transfer"        # account owner changes, territory realignment
+    DATA_CORRECTION = "Data correction"              # fixing country, industry or other master data
+    DEAL_UPDATE = "Deal update"                      # opportunity amount changes
+    LEAD_MANAGEMENT = "Lead management"              # lead status changes
+    MIXED = "Mixed"                                  # several of the above, none dominant
+
+
+class AIAnalysisOutput(BaseModel):
+    """What the AI model must return. Also used as the structured-output schema sent to Claude,
+    so it avoids constraints the API doesn't support (min/max length, numeric ranges)."""
+    summary: str = Field(description="2-4 plain-English sentences: what changes, on how many records, and why.")
+    category: ChangeCategory
+    category_reason: str = Field(description="One sentence explaining the category.")
+    risk_level: RiskLevel
+    risk_reasons: list[str] = Field(description="Short reasons for the risk level, most important first.")
+    missing_information: list[str] = Field(
+        description="Information a reviewer would need but the request doesn't give. Empty if nothing is missing.")
+
+
+class AIAnalysisStatus(str, Enum):
+    PENDING_REVIEW = "PENDING_REVIEW"  # waiting for the requester to confirm or reject
+    CONFIRMED = "CONFIRMED"            # requester accepted it (category + risk copied to the request)
+    REJECTED = "REJECTED"              # requester rejected it
+    SUPERSEDED = "SUPERSEDED"          # replaced by a newer analysis or a new CSV before review
+
+
+class AIAnalysis(ORMModel):
+    account_id: UUID                   # primary key
+    change_request_id: UUID            # FK -> change_requests.account_id
+    status: AIAnalysisStatus
+    summary: str
+    category: ChangeCategory
+    category_reason: str
+    risk_level: RiskLevel
+    risk_reasons: list[str]
+    missing_information: list[str]
+    model: str                         # e.g. "claude-sonnet-5-5", or "mock"
+    requested_by: UUID                 # FK -> users.account_id
+    created_at: datetime
+    reviewed_by: Optional[UUID] = None
+    reviewed_at: Optional[datetime] = None
+    review_comment: Optional[str] = None
+    # What the requester confirmed; differs from category/risk_level when they overrode the AI.
+    confirmed_category: Optional[ChangeCategory] = None
+    confirmed_risk_level: Optional[RiskLevel] = None
+
+
+class AIAnalysisConfirm(BaseModel):
+    """Confirm an analysis. Leave category / risk_level out to accept the AI's suggestion,
+    or set them to correct it."""
+    actor_id: UUID                     # must be the requester
+    category: Optional[ChangeCategory] = None
+    risk_level: Optional[RiskLevel] = None
+    comment: Optional[str] = None
+
+
+class AIAnalysisReject(BaseModel):
+    actor_id: UUID                     # must be the requester
+    comment: Optional[str] = None

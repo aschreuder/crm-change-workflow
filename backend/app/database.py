@@ -25,7 +25,9 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, relationship, sessionmaker
 
 from schemas import (
+    AIAnalysisStatus,
     AuditEventType,
+    ChangeCategory,
     ChangeRequestStatus,
     Decision,
     Priority,
@@ -138,8 +140,6 @@ class ChangeRequestORM(Base):
     assigned_approver_id: Mapped[Optional[uuid.UUID]] = mapped_column(
         ForeignKey("users.account_id"), index=True
     )
-    ai_summary: Mapped[Optional[str]] = mapped_column(Text)
-    ai_missing_information: Mapped[Optional[str]] = mapped_column(Text)
     # Set by the business rules on validation; NULL = not validated since the last upload.
     requires_approval: Mapped[Optional[bool]] = mapped_column(Boolean)
     approval_reasons: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSONB)
@@ -164,6 +164,11 @@ class ChangeRequestORM(Base):
         back_populates="change_request",
         cascade="all, delete-orphan",
         order_by="ChangeRequestItemORM.row_number",
+    )
+    ai_analyses: Mapped[list[AIAnalysisORM]] = relationship(
+        back_populates="change_request",
+        cascade="all, delete-orphan",
+        order_by="AIAnalysisORM.created_at.desc()",
     )
 
 
@@ -204,6 +209,48 @@ class ChangeRequestItemORM(Base):
 
 # Lets clash checks find other requests changing the same record + field quickly.
 Index("ix_items_record_field", ChangeRequestItemORM.record_id, ChangeRequestItemORM.field)
+
+
+class AIAnalysisORM(Base):
+    """An AI analysis of a change request, kept separate from the request itself.
+
+    Every run adds a row. The requester confirms or rejects it; only a confirmed
+    analysis changes the request (its category and risk_level).
+    """
+    __tablename__ = "ai_analyses"
+
+    account_id: Mapped[uuid.UUID] = uuid_pk()
+    change_request_id: Mapped[uuid.UUID] = mapped_column(
+        ForeignKey("change_requests.account_id", ondelete="CASCADE"), nullable=False, index=True
+    )
+    status: Mapped[AIAnalysisStatus] = mapped_column(
+        pg_enum(AIAnalysisStatus, "ai_analysis_status"), nullable=False,
+        default=AIAnalysisStatus.PENDING_REVIEW,
+    )
+
+    # What the AI returned
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    category: Mapped[ChangeCategory] = mapped_column(pg_enum(ChangeCategory, "change_category"), nullable=False)
+    category_reason: Mapped[str] = mapped_column(Text, nullable=False)
+    risk_level: Mapped[RiskLevel] = mapped_column(pg_enum(RiskLevel, "risk_level"), nullable=False)
+    risk_reasons: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    missing_information: Mapped[list[str]] = mapped_column(JSONB, nullable=False, default=list)
+    model: Mapped[str] = mapped_column(String(100), nullable=False)
+    raw_output: Mapped[Optional[dict[str, Any]]] = mapped_column(JSONB)  # exactly what the model returned
+    requested_by: Mapped[uuid.UUID] = mapped_column(ForeignKey("users.account_id"), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, server_default=func.now()
+    )
+
+    # The requester's review
+    reviewed_by: Mapped[Optional[uuid.UUID]] = mapped_column(ForeignKey("users.account_id"))
+    reviewed_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True))
+    review_comment: Mapped[Optional[str]] = mapped_column(Text)
+    confirmed_category: Mapped[Optional[ChangeCategory]] = mapped_column(
+        pg_enum(ChangeCategory, "change_category"))
+    confirmed_risk_level: Mapped[Optional[RiskLevel]] = mapped_column(pg_enum(RiskLevel, "risk_level"))
+
+    change_request: Mapped[ChangeRequestORM] = relationship(back_populates="ai_analyses")
 
 
 class ApprovalDecisionORM(Base):
