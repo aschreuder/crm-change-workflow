@@ -18,7 +18,7 @@ from typing import Any, Optional
 
 from dotenv import load_dotenv
 from sqlalchemy import (
-    DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine,
+    Boolean, DateTime, Enum, ForeignKey, Index, Integer, String, Text, UniqueConstraint, create_engine,
     func, inspect, text,
 )
 from sqlalchemy.dialects.postgresql import JSONB, UUID
@@ -140,6 +140,9 @@ class ChangeRequestORM(Base):
     )
     ai_summary: Mapped[Optional[str]] = mapped_column(Text)
     ai_missing_information: Mapped[Optional[str]] = mapped_column(Text)
+    # Set by the business rules on validation; NULL = not validated since the last upload.
+    requires_approval: Mapped[Optional[bool]] = mapped_column(Boolean)
+    approval_reasons: Mapped[Optional[list[dict[str, Any]]]] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()
     )
@@ -254,7 +257,29 @@ def init_db() -> None:
     """
     check_items_table_is_current()
     Base.metadata.create_all(bind=engine)
+    add_missing_optional_columns()
     sync_enum_values()
+
+
+def add_missing_optional_columns() -> None:
+    """Add new optional (nullable) columns to tables that already exist.
+
+    create_all() only creates missing tables, so a column added to a model later
+    (e.g. change_requests.requires_approval) would otherwise be missing. Only
+    nullable columns are added; anything else still needs a migration tool (Alembic).
+    """
+    inspector = inspect(engine)
+    with engine.begin() as conn:
+        for table in Base.metadata.sorted_tables:
+            if not inspector.has_table(table.name):
+                continue
+            existing = {c["name"] for c in inspector.get_columns(table.name)}
+            for column in table.columns:
+                if column.name in existing or not column.nullable:
+                    continue
+                col_type = column.type.compile(dialect=engine.dialect)
+                conn.execute(text(f'ALTER TABLE "{table.name}" ADD COLUMN IF NOT EXISTS '
+                                  f'"{column.name}" {col_type}'))
 
 
 def check_items_table_is_current() -> None:

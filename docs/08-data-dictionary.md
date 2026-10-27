@@ -26,6 +26,8 @@
 | ai_missing_information | text            | AI recommendations                                  |
 | created_at             | timestamp       | Required                                            |
 | updated_at             | timestamp       | Required                                            |
+| requires approval      | text            | Required                                            |
+| approval reasons       | text            | Required                                            |
 
 ### approval_decisions
 

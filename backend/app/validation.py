@@ -1,13 +1,13 @@
 """
-Validation run on submit (the format checks already ran on upload, in csv_template.py).
+Data checks run by POST /change-requests/{id}/validate (the format checks already
+ran on upload, in csv_template.py; the business rules are in business_rules.py).
 
 A change is identified by (record_id, field). The checks:
 
-1. Duplicate in file   - the same record + field appears twice in the request.
-2. Open-request clash  - another request that is still in progress (submitted,
+1. Open-request clash  - another request that is still in progress (submitted,
                          validating, ready for approval or approved) already
                          changes the same record + field.
-3. Salesforce          - the record exists; an opportunity belongs to the row's
+2. Salesforce          - the record exists; an opportunity belongs to the row's
                          account; the change hasn't already been made (Salesforce
                          already has new_value); and current_value matches what
                          Salesforce has now.
@@ -22,7 +22,7 @@ from uuid import UUID
 from sqlalchemy import select, tuple_
 from sqlalchemy.orm import Session
 
-from csv_template import ALLOWED_FIELDS, EMPTY_TOKEN, check_duplicates_in_file, same_sf_id
+from csv_template import ALLOWED_FIELDS, EMPTY_TOKEN, same_sf_id
 from salesforce import SalesforceClient, SalesforceUnavailable, get_salesforce_client
 from schemas import ChangeRequestStatus, IssueSeverity, SalesforceObject, ValidationIssue
 
@@ -51,7 +51,7 @@ def _show(value: Optional[str]) -> str:
 
 
 # ---------------------------------------------------------------------------
-# 2. Clashes with other open requests
+# 1. Clashes with other open requests
 # ---------------------------------------------------------------------------
 
 
@@ -87,7 +87,7 @@ def check_open_request_conflicts(db: Session, change_request_id: UUID,
 
 
 # ---------------------------------------------------------------------------
-# 3. Salesforce
+# 2. Salesforce
 # ---------------------------------------------------------------------------
 
 
@@ -117,7 +117,7 @@ def check_against_salesforce(client: Optional[SalesforceClient],
         except Exception as exc:  # network/auth problems shouldn't crash validation
             issues.append(ValidationIssue(
                 code="salesforce_unavailable",
-                message=f"Could not read {obj.value} records from Salesforce: {exc}. Try submitting again later.",
+                message=f"Could not read {obj.value} records from Salesforce: {exc}. Try validating again later.",
             ))
             continue
         found_upper = {rid.upper(): values for rid, values in found.items()}
@@ -170,8 +170,4 @@ def validate_request(db: Session, change_request_id: UUID, rows: list[ChangeRow]
         salesforce_issues = check_against_salesforce(client, rows)
     except SalesforceUnavailable as exc:
         salesforce_issues = [ValidationIssue(code="salesforce_unavailable", message=str(exc))]
-    return (
-        check_duplicates_in_file(rows)
-        + check_open_request_conflicts(db, change_request_id, rows)
-        + salesforce_issues
-    )
+    return check_open_request_conflicts(db, change_request_id, rows) + salesforce_issues

@@ -54,13 +54,14 @@ from schemas import (
     ImplementRequest,
     N8nRequestSubmittedPayload,
     Priority,
-    SubmitResponse,
+    ValidateResponse,
     User,
     UserCreate,
     ValidationIssue,
     ValidationReport,
     utcnow,
 )
+import business_rules
 from validation import validate_request
 
 # ---------------------------------------------------------------------------
@@ -91,7 +92,7 @@ app.add_middleware(
 N8N_WEBHOOK_SECRET = os.getenv("N8N_WEBHOOK_SECRET", "change-me")
 
 # TODO(workflow): move to your workflow-rules module.
-# Statuses in which the requester may replace the CSV and (re)submit.
+# Statuses in which the requester may replace the CSV and validate.
 EDITABLE_STATUSES = {ChangeRequestStatus.DRAFT, ChangeRequestStatus.VALIDATION_FAILED}
 
 # ---------------------------------------------------------------------------
@@ -118,7 +119,7 @@ _last_audit_time = utcnow()
 
 def audit_timestamp() -> datetime:
     """Strictly increasing timestamps, so audit events written in the same transaction
-    (e.g. SUBMITTED then VALIDATING) keep their order. PostgreSQL's now() would give
+    (e.g. CSV uploaded then status changed) keep their order. PostgreSQL's now() would give
     them all the same time."""
     global _last_audit_time
     ts = utcnow()
@@ -308,8 +309,8 @@ async def upload_change_request(
     """Upload the standard CSV template and create a DRAFT change request from it.
 
     The whole file is checked first. If anything is wrong, it is rejected (422) with
-    every problem listed and nothing is stored. Submit the draft afterwards with
-    POST /change-requests/{id}/submit.
+    every problem listed and nothing is stored. Validate the draft afterwards with
+    POST /change-requests/{id}/validate.
     """
     require_user(db, requester_id, "Requester")
     rows, error = await read_csv_or_error(file)
@@ -409,7 +410,7 @@ async def replace_csv(
 ):
     """Replace the changes of a DRAFT or VALIDATION_FAILED request with a corrected CSV.
 
-    A VALIDATION_FAILED request goes back to DRAFT, ready to be submitted again.
+    A VALIDATION_FAILED request goes back to DRAFT. Validate it again afterwards.
     """
     cr = get_or_404(db, id)
     require_editable(cr, "replace the CSV of")
@@ -423,6 +424,8 @@ async def replace_csv(
     db.flush()  # delete the old rows first, so the unique constraint isn't hit
     cr.items.extend(to_items(rows))
     cr.requested_change = summarise(rows)
+    cr.requires_approval = None  # the old validation no longer applies
+    cr.approval_reasons = None
     record_audit(db, cr, AuditEventType.CSV_UPLOADED, actor, new_value=file.filename, rows=len(rows))
     if cr.status != ChangeRequestStatus.DRAFT:
         set_status(db, cr, ChangeRequestStatus.DRAFT, AuditEventType.STATUS_CHANGED, actor,
@@ -430,52 +433,54 @@ async def replace_csv(
     return save(db, cr)
 
 
-@app.post("/change-requests/{id}/submit", response_model=SubmitResponse, tags=["actions"])
-def submit(id: UUID, body: ActorRequest, db: Session = Depends(get_db)):
-    """Submit and validate a request.
+@app.post("/change-requests/{id}/validate", response_model=ValidateResponse, tags=["actions"])
+def validate(id: UUID, body: ActorRequest, db: Session = Depends(get_db)):
+    """Validate a draft: data checks (Salesforce, other open requests) plus business rules.
 
-    DRAFT (or VALIDATION_FAILED) -> SUBMITTED -> VALIDATING -> READY_FOR_APPROVAL or
-    VALIDATION_FAILED. Every status change is recorded in the audit trail; the
-    report is returned here and also kept for GET /change-requests/{id}/validation.
-    Each item's `issues` shows the problems found on that row.
+    The request stays in DRAFT. The result is stored on the request
+    (`requires_approval`, `approval_reasons`), on each item (`issues`) and in the
+    audit trail, and is also available from GET /change-requests/{id}/validation.
+    Run it again at any time, e.g. after replacing the CSV.
     """
     cr = get_or_404(db, id)
-    require_editable(cr, "submit")
+    require_editable(cr, "validate")
     if not cr.items:
         raise HTTPException(422, "This request has no changes. Create it by uploading a CSV "
                                  "to POST /change-requests/upload.")
     require_user(db, body.actor_id, "Actor")
 
-    set_status(db, cr, ChangeRequestStatus.SUBMITTED, AuditEventType.SUBMITTED,
-               body.actor_id, comment=body.comment)
-    set_status(db, cr, ChangeRequestStatus.VALIDATING, AuditEventType.STATUS_CHANGED, "system")
-    db.commit()  # other requests now see this one as in progress while it is checked
-
     items = list(cr.items)
+    rules = business_rules.evaluate(items)
     try:
-        issues = validate_request(db, cr.account_id, items)
-    except Exception as exc:  # never leave a request stuck in VALIDATING
-        db.rollback()
-        issues = [ValidationIssue(code="validation_error",
-                                  message=f"Validation could not be completed: {exc}. Try submitting again.")]
-    report = ValidationReport.build(cr.account_id, len(items), issues)
+        data_issues = validate_request(db, cr.account_id, items)
+    except Exception as exc:  # report it instead of failing the whole call
+        data_issues = [ValidationIssue(code="validation_error",
+                                       message=f"Validation could not be completed: {exc}. Try again.")]
+    report = ValidationReport.build(cr.account_id, len(items), rules.issues + data_issues,
+                                    rules.requires_approval, rules.approval_reasons)
 
     by_row: dict[int, list[dict]] = {}
-    for issue in issues:
+    for issue in report.issues:
         if issue.row is not None:
             by_row.setdefault(issue.row, []).append(issue.model_dump(mode="json"))
     for item in items:
         item.issues = by_row.get(item.row_number, [])
+    cr.requires_approval = report.requires_approval
+    cr.approval_reasons = [r.model_dump(mode="json") for r in report.approval_reasons]
 
-    if report.valid:
-        outcome, event = ChangeRequestStatus.READY_FOR_APPROVAL, AuditEventType.VALIDATION_PASSED
-    else:
-        outcome, event = ChangeRequestStatus.VALIDATION_FAILED, AuditEventType.VALIDATION_FAILED
-    set_status(db, cr, outcome, event, "system", errors=report.error_count,
-               warnings=report.warning_count, report=report.model_dump(mode="json"))
+    record_audit(
+        db, cr,
+        AuditEventType.VALIDATION_PASSED if report.valid else AuditEventType.VALIDATION_FAILED,
+        body.actor_id,
+        new_value="valid" if report.valid else "invalid",
+        errors=report.error_count, warnings=report.warning_count,
+        requires_approval=report.requires_approval, comment=body.comment,
+        report=report.model_dump(mode="json"),
+    )
     save(db, cr)
-    # TODO(workflow): notify n8n here, e.g. to route READY_FOR_APPROVAL requests to an approver.
-    return SubmitResponse(change_request=ChangeRequest.model_validate(cr), validation=report)
+    # TODO(workflow): when submitting is switched back on, valid requests move on from here
+    # (e.g. to READY_FOR_APPROVAL, routed to an approver when requires_approval is true).
+    return ValidateResponse(change_request=ChangeRequest.model_validate(cr), validation=report)
 
 
 @app.get("/change-requests/{id}/validation", response_model=ValidationReport, tags=["change-requests"])

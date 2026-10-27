@@ -12,7 +12,7 @@ from enum import Enum
 from typing import Any, Optional
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 
 def utcnow() -> datetime:
@@ -132,6 +132,13 @@ class ChangeRequestUpdate(BaseModel):
     actor_id: Optional[UUID] = None  # who is editing; not stored on the request
 
 
+class ApprovalReason(BaseModel):
+    """Why a request needs business approval (see business_rules.py)."""
+    code: str                      # e.g. "account_owner_change", "too_many_accounts"
+    message: str
+    rows: list[int] = Field(default_factory=list)  # CSV lines that triggered it, if any
+
+
 class ChangeRequest(ORMModel):
     account_id: UUID = Field(default_factory=uuid4)  # primary key
     title: str
@@ -146,8 +153,15 @@ class ChangeRequest(ORMModel):
     assigned_approver_id: Optional[UUID] = None  # FK -> users.account_id, null until routed
     ai_summary: Optional[str] = None
     ai_missing_information: Optional[str] = None
+    requires_approval: Optional[bool] = None  # set by the business rules; None = not validated yet
+    approval_reasons: list[ApprovalReason] = Field(default_factory=list)
     created_at: datetime = Field(default_factory=utcnow)
     updated_at: datetime = Field(default_factory=utcnow)
+
+    @field_validator("approval_reasons", mode="before")
+    @classmethod
+    def _none_is_empty(cls, value: Any) -> Any:
+        return [] if value is None else value
 
 
 # ---------------------------------------------------------------------------
@@ -287,18 +301,20 @@ class CsvUploadError(BaseModel):
 
 
 class ValidationReport(BaseModel):
-    """Result of validating a submitted request."""
+    """Result of validating a request: data checks plus business rules."""
     change_request_id: UUID
-    valid: bool
+    valid: bool                    # False when there is at least one error
     rows_checked: int
     error_count: int
     warning_count: int
     issues: list[ValidationIssue]
+    requires_approval: bool
+    approval_reasons: list[ApprovalReason] = Field(default_factory=list)
     checked_at: datetime = Field(default_factory=utcnow)
 
     @classmethod
-    def build(cls, change_request_id: UUID, rows_checked: int,
-              issues: list[ValidationIssue]) -> "ValidationReport":
+    def build(cls, change_request_id: UUID, rows_checked: int, issues: list[ValidationIssue],
+              requires_approval: bool, approval_reasons: list[ApprovalReason]) -> "ValidationReport":
         errors = sum(i.severity == IssueSeverity.ERROR for i in issues)
         return cls(
             change_request_id=change_request_id,
@@ -307,11 +323,13 @@ class ValidationReport(BaseModel):
             error_count=errors,
             warning_count=len(issues) - errors,
             issues=sorted(issues, key=lambda i: (i.row or 0, i.column or "")),
+            requires_approval=requires_approval,
+            approval_reasons=approval_reasons,
         )
 
 
-class SubmitResponse(BaseModel):
-    """POST /change-requests/{id}/submit: the request after validation, plus the report."""
+class ValidateResponse(BaseModel):
+    """POST /change-requests/{id}/validate: the request after validation, plus the report."""
     change_request: ChangeRequest
     validation: ValidationReport
 

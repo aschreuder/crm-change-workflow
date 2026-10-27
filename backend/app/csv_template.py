@@ -18,7 +18,8 @@ Every column is mandatory and no other columns are allowed.
 
 `parse_csv()` never raises for bad content: it returns the clean rows plus a
 list of every problem found, so the user can fix the whole file in one go.
-The checks against Salesforce and other requests run on submit (validation.py).
+The checks against Salesforce, other requests and the business rules run on
+POST /change-requests/{id}/validate (validation.py, business_rules.py).
 """
 
 from __future__ import annotations
@@ -39,7 +40,7 @@ from schemas import SalesforceObject, ValidationIssue
 TEMPLATE_COLUMNS = ["account_id", "name", "email", "role",
                     "object", "record_id", "field", "current_value", "new_value"]
 
-EMPTY_TOKEN = "empty"     # write this in current_value when the field is blank in Salesforce
+EMPTY_TOKEN = "(empty)"     # write this in current_value when the field is blank in Salesforce
 MAX_ROWS = 500
 MAX_FILE_BYTES = 1_000_000  # 1 MB
 
